@@ -200,6 +200,11 @@ resource "aws_lb_target_group" "result" {
     path    = "/healthz"
     matcher = "200"
   }
+  stickiness {
+    enabled         = true
+    type            = "lb_cookie"
+    cookie_duration = 86400
+  }
 }
 
 resource "aws_lb_listener" "vote" {
