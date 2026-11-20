@@ -1,4 +1,3 @@
-raise SystemExit(1)  # Intentional startup failure for F4 rollback test
 from flask import Flask, render_template, request, make_response, g
 from redis import Redis
 import os
