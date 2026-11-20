@@ -51,3 +51,28 @@ jobs:
 
       - name: Validate configuration
         run: terraform validate -no-color
+  build:
+    name: Build ${{ matrix.service }}
+    needs: checks
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [vote, result, worker]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Build image
+        env:
+          SERVICE: ${{ matrix.service }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            -t "voting-${SERVICE}:${IMAGE_TAG}" \
+            "services/${SERVICE}"
