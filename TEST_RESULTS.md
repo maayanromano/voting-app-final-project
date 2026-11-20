@@ -34,4 +34,9 @@ The intentional failure was then removed through a pull request.
 The recovery pipeline successfully deployed dev and prod.
 
 ## F5 — Cleanup
-Pending: destroy prod, then dev, then bootstrap, and verify removal.
+Terraform destroy completed successfully in this order:
+- prod: 43 resources destroyed.
+- dev: 43 resources destroyed.
+- bootstrap: 13 resources destroyed.
+
+No RDS automated backups remained in eu-north-1.
