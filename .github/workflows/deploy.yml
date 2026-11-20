@@ -1,1 +1,360 @@
-# The pipeline (contracts P1-P11). Fill it in. Until it has on: and jobs:, GitHub shows it as an invalid workflow
+name: Voting App CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "services/**"
+      - "infra/**"
+      - ".github/workflows/**"
+
+  push:
+    branches: [main]
+    paths:
+      - "services/**"
+      - "infra/**"
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  checks:
+    name: Terraform checks
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: infra
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.17.1"
+          terraform_wrapper: false
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive
+
+      - name: Initialize without backend
+        run: terraform init -backend=false -input=false -no-color
+
+      - name: Validate configuration
+        run: terraform validate -no-color
+  build:
+    name: Build ${{ matrix.service }}
+    needs: checks
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [vote, result, worker]
+
+    env:
+      SERVICE: ${{ matrix.service }}
+      IMAGE_TAG: ${{ github.sha }}
+      NAME_PREFIX: ${{ vars.NAME_PREFIX }}
+      AWS_REGION: eu-north-1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Configure AWS credentials
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: eu-north-1
+
+      - name: Resolve ECR image and check tag
+        id: ecr
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          REPOSITORY="${NAME_PREFIX}-${SERVICE}"
+
+          REPOSITORY_URL=$(aws ecr describe-repositories \
+            --repository-names "$REPOSITORY" \
+            --query 'repositories[0].repositoryUri' \
+            --output text)
+
+          EXISTING_TAG=$(aws ecr list-images \
+            --repository-name "$REPOSITORY" \
+            --filter tagStatus=TAGGED \
+            --query "imageIds[?imageTag=='${IMAGE_TAG}'].imageTag" \
+            --output text)
+
+          echo "image=${REPOSITORY_URL}:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "registry=${REPOSITORY_URL%%/*}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$EXISTING_TAG" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Image tag already exists; skipping build and push."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build image for pull request
+        if: github.event_name == 'pull_request'
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            -t "voting-${SERVICE}:${IMAGE_TAG}" \
+            "services/${SERVICE}"
+
+      - name: Login to ECR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.ecr.outputs.exists == 'false'
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" |
+            docker login --username AWS --password-stdin "$REGISTRY"
+
+      - name: Build and push image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.ecr.outputs.exists == 'false'
+        env:
+          IMAGE: ${{ steps.ecr.outputs.image }}
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --push \
+            -t "$IMAGE" \
+            "services/${SERVICE}"
+  plan:
+    name: Plan ${{ matrix.stage }}
+    if: github.event_name == 'pull_request'
+    needs: checks
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        stage: [dev, prod]
+
+    defaults:
+      run:
+        working-directory: infra
+
+    env:
+      STAGE: ${{ matrix.stage }}
+      STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_VAR_name_prefix: ${{ vars.NAME_PREFIX }}
+      TF_VAR_image_tag: ${{ github.sha }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.17.1"
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: eu-north-1
+
+      - name: Initialize environment state
+        run: |
+          terraform init -input=false -no-color \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="key=voting-app/${STAGE}/terraform.tfstate" \
+            -backend-config="region=eu-north-1" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform plan
+        run: |
+          terraform plan -input=false -no-color \
+            -var-file="envs/${STAGE}.tfvars"
+  deploy_dev:
+    name: Deploy dev
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [checks, build]
+    runs-on: ubuntu-latest
+    environment: dev
+
+    permissions:
+      contents: read
+      id-token: write
+
+    concurrency:
+      group: voting-app-dev
+      cancel-in-progress: false
+
+    defaults:
+      run:
+        working-directory: infra
+
+    env:
+      STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_VAR_name_prefix: ${{ vars.NAME_PREFIX }}
+      TF_VAR_image_tag: ${{ github.sha }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.17.1"
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: eu-north-1
+
+      - name: Initialize dev state
+        run: |
+          terraform init -input=false -no-color \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="key=voting-app/dev/terraform.tfstate" \
+            -backend-config="region=eu-north-1" \
+            -backend-config="use_lockfile=true"
+
+      - name: Deploy dev
+        run: |
+          terraform apply -auto-approve -input=false -no-color \
+            -var-file=envs/dev.tfvars
+
+      - name: Smoke test
+        run: |
+          VOTE_URL=$(terraform output -raw vote_url)
+          RESULT_URL=$(terraform output -raw result_url)
+
+          for URL in "$VOTE_URL" "$RESULT_URL"; do
+            STATUS=$(curl --silent --show-error --fail \
+              --connect-timeout 10 \
+              --max-time 30 \
+              --retry 10 \
+              --retry-delay 6 \
+              --retry-all-errors \
+              --output /dev/null \
+              --write-out '%{http_code}' \
+              "${URL}/healthz")
+
+            if [ "$STATUS" != "200" ]; then
+              echo "Health check failed for ${URL}: HTTP ${STATUS}"
+              exit 1
+            fi
+
+            echo "Health check passed for ${URL}"
+          done
+
+      - name: Verify deployed version
+        run: |
+          terraform plan -detailed-exitcode -input=false -no-color \
+            -var-file=envs/dev.tfvars
+  deploy_prod:
+    name: Deploy prod
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: deploy_dev
+    runs-on: ubuntu-latest
+    environment: prod
+
+    permissions:
+      contents: read
+      id-token: write
+
+    concurrency:
+      group: voting-app-prod
+      cancel-in-progress: false
+
+    defaults:
+      run:
+        working-directory: infra
+
+    env:
+      STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_VAR_name_prefix: ${{ vars.NAME_PREFIX }}
+      TF_VAR_image_tag: ${{ github.sha }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.17.1"
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: eu-north-1
+
+      - name: Initialize prod state
+        run: |
+          terraform init -input=false -no-color \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="key=voting-app/prod/terraform.tfstate" \
+            -backend-config="region=eu-north-1" \
+            -backend-config="use_lockfile=true"
+
+      - name: Deploy prod
+        run: |
+          terraform apply -auto-approve -input=false -no-color \
+            -var-file=envs/prod.tfvars
+
+      - name: Smoke test
+        run: |
+          VOTE_URL=$(terraform output -raw vote_url)
+          RESULT_URL=$(terraform output -raw result_url)
+
+          for URL in "$VOTE_URL" "$RESULT_URL"; do
+            STATUS=$(curl --silent --show-error --fail \
+              --connect-timeout 10 \
+              --max-time 30 \
+              --retry 10 \
+              --retry-delay 6 \
+              --retry-all-errors \
+              --output /dev/null \
+              --write-out '%{http_code}' \
+              "${URL}/healthz")
+
+            if [ "$STATUS" != "200" ]; then
+              echo "Health check failed for ${URL}: HTTP ${STATUS}"
+              exit 1
+            fi
+
+            echo "Health check passed for ${URL}"
+          done
+
+      - name: Verify deployed version
+        run: |
+          terraform plan -detailed-exitcode -input=false -no-color \
+            -var-file=envs/prod.tfvars
