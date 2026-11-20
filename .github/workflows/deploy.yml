@@ -56,10 +56,20 @@ jobs:
     needs: checks
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: read
+      id-token: write
+
     strategy:
       fail-fast: false
       matrix:
         service: [vote, result, worker]
+
+    env:
+      SERVICE: ${{ matrix.service }}
+      IMAGE_TAG: ${{ github.sha }}
+      NAME_PREFIX: ${{ vars.NAME_PREFIX }}
+      AWS_REGION: eu-north-1
 
     steps:
       - name: Checkout repository
@@ -67,14 +77,65 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Build image
-        env:
-          SERVICE: ${{ matrix.service }}
-          IMAGE_TAG: ${{ github.sha }}
+      - name: Configure AWS credentials
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: eu-north-1
+
+      - name: Resolve ECR image and check tag
+        id: ecr
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          REPOSITORY="${NAME_PREFIX}-${SERVICE}"
+
+          REPOSITORY_URL=$(aws ecr describe-repositories \
+            --repository-names "$REPOSITORY" \
+            --query 'repositories[0].repositoryUri' \
+            --output text)
+
+          EXISTING_TAG=$(aws ecr list-images \
+            --repository-name "$REPOSITORY" \
+            --filter tagStatus=TAGGED \
+            --query "imageIds[?imageTag=='${IMAGE_TAG}'].imageTag" \
+            --output text)
+
+          echo "image=${REPOSITORY_URL}:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "registry=${REPOSITORY_URL%%/*}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$EXISTING_TAG" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Image tag already exists; skipping build and push."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build image for pull request
+        if: github.event_name == 'pull_request'
         run: |
           docker build \
             --platform linux/amd64 \
             -t "voting-${SERVICE}:${IMAGE_TAG}" \
+            "services/${SERVICE}"
+
+      - name: Login to ECR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.ecr.outputs.exists == 'false'
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" |
+            docker login --username AWS --password-stdin "$REGISTRY"
+
+      - name: Build and push image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.ecr.outputs.exists == 'false'
+        env:
+          IMAGE: ${{ steps.ecr.outputs.image }}
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --push \
+            -t "$IMAGE" \
             "services/${SERVICE}"
   plan:
     name: Plan ${{ matrix.stage }}
