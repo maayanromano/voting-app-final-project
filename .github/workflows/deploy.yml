@@ -1,1 +1,53 @@
-# The pipeline (contracts P1-P11). Fill it in. Until it has on: and jobs:, GitHub shows it as an invalid workflow
+name: Voting App CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "services/**"
+      - "infra/**"
+      - ".github/workflows/**"
+
+  push:
+    branches: [main]
+    paths:
+      - "services/**"
+      - "infra/**"
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  checks:
+    name: Terraform checks
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: infra
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.17.1"
+          terraform_wrapper: false
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive
+
+      - name: Initialize without backend
+        run: terraform init -backend=false -input=false -no-color
+
+      - name: Validate configuration
+        run: terraform validate -no-color
